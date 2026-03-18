@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { Suspense, useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { usePositions } from '@/hooks/usePositions';
 import { useEquipment } from '@/hooks/useEquipment';
@@ -28,6 +28,14 @@ interface BatchResult {
 }
 
 export default function ImageGenPage() {
+  return (
+    <Suspense fallback={<div className="p-8 text-gray-400">Loading...</div>}>
+      <ImageGenContent />
+    </Suspense>
+  );
+}
+
+function ImageGenContent() {
   const searchParams = useSearchParams();
   const { positions } = usePositions();
   const { allEquipmentNames } = useEquipment();
