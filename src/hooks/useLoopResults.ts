@@ -53,7 +53,7 @@ export function useLoopResults() {
 
     // For each exercise, only keep rows from the latest batch (same created_at prefix within ~1 hour)
     const summaries: LoopExerciseSummary[] = [];
-    for (const [exerciseName, exerciseRows] of grouped) {
+    for (const [exerciseName, exerciseRows] of Array.from(grouped)) {
       // Sort by created_at desc
       exerciseRows.sort((a, b) => b.created_at.localeCompare(a.created_at));
 
