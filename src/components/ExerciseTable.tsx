@@ -642,7 +642,7 @@ export default function ExerciseTable({
         className="overflow-x-auto rounded-b-xl border-x border-b border-gray-200 shadow-sm focus:outline-none select-none bg-gray-50"
         tabIndex={0}
       >
-        <table className="w-full" style={{ minWidth: '720px' }}>
+        <table className="w-full">
           <thead className="bg-gray-50 border-b border-gray-200">
             <tr>
               <th

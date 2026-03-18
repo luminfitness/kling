@@ -414,10 +414,10 @@ export default function LibraryPage() {
           </button>
         </div>
       ) : (
-        <div className="flex gap-4">
+        <div className="flex gap-4" style={{ height: 'calc(100vh - 180px)' }}>
           {/* Pending Templates — left column */}
           {sortedTemplates.length > 0 && (
-            <div className="relative z-20 w-[520px] flex-shrink-0">
+            <div className="relative z-20 w-[520px] flex-shrink-0 overflow-y-auto">
               <TemplateTable
                 templates={sortedTemplates}
                 selectedIds={selectedTemplates}

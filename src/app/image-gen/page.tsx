@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { usePositions } from '@/hooks/usePositions';
 import { useEquipment } from '@/hooks/useEquipment';
 import {
@@ -27,14 +28,26 @@ interface BatchResult {
 }
 
 export default function ImageGenPage() {
+  const searchParams = useSearchParams();
   const { positions } = usePositions();
   const { allEquipmentNames } = useEquipment();
 
   const STANDING_POSITION_ID = '2394f11a-d011-4739-96a2-46384c3ab46f';
   const PINNED_POSITION_NAMES = ['standing', 'standing r', 'side-to-side hops', 'standing l', 'dropsquat_bodyweight'];
 
-  // Mode: generate, edit, or canva
-  const [mode, setMode] = useState<'generate' | 'edit' | 'canva'>('edit');
+  // Mode: generate, edit, or canva — read from ?tab= query param
+  const tabParam = searchParams.get('tab');
+  const initialMode = (tabParam === 'generate' || tabParam === 'edit' || tabParam === 'canva') ? tabParam : 'generate';
+  const [mode, setMode] = useState<'generate' | 'edit' | 'canva'>(initialMode);
+
+  // Sync mode when nav link changes the ?tab= param
+  useEffect(() => {
+    const newTab = searchParams.get('tab');
+    const newMode = (newTab === 'generate' || newTab === 'edit' || newTab === 'canva') ? newTab : 'generate';
+    if (newMode !== mode) {
+      setMode(newMode);
+    }
+  }, [searchParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Generate mode: single reference image (max 1)
   // Edit mode: images to edit (unlimited)
