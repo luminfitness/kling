@@ -1,0 +1,43 @@
+{
+  "name": "kling-avatar-transformer",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.72.1",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
+    "@google/genai": "^1.40.0",
+    "@supabase/supabase-js": "^2.94.1",
+    "@vercel/blob": "^0.27.0",
+    "dropbox": "^10.34.0",
+    "ffmpeg-static": "^5.3.0",
+    "jsonwebtoken": "^9.0.2",
+    "jszip": "^3.10.1",
+    "next": "14.2.35",
+    "openai": "^6.18.0",
+    "puppeteer": "^24.39.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "uuid": "^11.1.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.15.3",
+    "@types/react": "^18.3.20",
+    "@types/react-dom": "^18.3.6",
+    "@types/uuid": "^10.0.0",
+    "autoprefixer": "^10.4.24",
+    "csv-parse": "^6.2.0",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.3"
+  }
+}

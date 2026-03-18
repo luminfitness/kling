@@ -1,0 +1,349 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { getTasks, getQueuedTasks, getActiveTasks, updateTask, removeTask, addTask } from '@/lib/taskQueue';
+import { autoSaveCompletedTask } from '@/lib/autoSave';
+import { usePositions } from '@/hooks/usePositions';
+import { supabase } from '@/lib/supabase';
+import type { QueuedTask, ExerciseTemplate } from '@/types';
+
+export interface ProcessingStatus {
+  taskId: string;
+  exerciseName: string;
+  stage: 'downloading' | 'submitting' | 'waiting';
+  startedAt: string; // ISO timestamp when this stage started
+}
+
+export function useQueueProcessor() {
+  const [tasks, setTasks] = useState<QueuedTask[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null);
+
+  const isProcessingRef = useRef(false);
+  const { getPositionImageUrl } = usePositions();
+  const getPositionImageUrlRef = useRef(getPositionImageUrl);
+  getPositionImageUrlRef.current = getPositionImageUrl;
+
+  // Load all tasks from Supabase
+  const loadTasks = useCallback(async () => {
+    const allTasks = await getTasks();
+    setTasks(allTasks);
+    setLoading(false);
+    return allTasks;
+  }, []);
+
+  // Add templates to queue (saves to Supabase immediately)
+  const addToQueue = useCallback(async (templates: ExerciseTemplate[]) => {
+    if (templates.length === 0) return;
+
+    const batchId = `batch-${Date.now()}`;
+    const startedAt = new Date().toISOString();
+
+    // Insert all templates as queued tasks
+    for (let i = 0; i < templates.length; i++) {
+      const template = templates[i];
+      const taskId = crypto.randomUUID();
+
+      await addTask({
+        taskId,
+        status: 'queued',
+        positionId: template.positionId,
+        positionName: template.positionName,
+        mode: 'std',
+        exerciseName: template.exerciseName,
+        equipmentType: template.equipmentType,
+        customPrompt: template.customPrompt,
+        force: template.force,
+        mechanic: template.mechanic,
+        limbs: template.limbs,
+        body: template.body,
+        difficulty: template.difficulty,
+        musclesTargeted: template.musclesTargeted,
+        startedAt,
+        templateId: template.id,
+        batchId,
+        batchPosition: i + 1,
+        batchTotal: templates.length,
+        // Source info for resuming downloads
+        sourceYoutubeUrl: template.youtubeUrl,
+        sourceStartTime: template.startTime,
+        sourceEndTime: template.endTime,
+        sourceInputUrl: template.inputVideoUrl,
+      });
+
+      // Delete the template from pending
+      await supabase.from('exercise_templates').delete().eq('id', template.id);
+    }
+
+    // Reload tasks and start processing
+    await loadTasks();
+    processQueue();
+  }, [loadTasks]);
+
+  // Process the queue (one item at a time)
+  const processQueue = useCallback(async () => {
+    if (isProcessingRef.current) {
+      console.log('Already processing, skipping');
+      return;
+    }
+
+    isProcessingRef.current = true;
+
+    try {
+      while (true) {
+        // Check for active tasks on Kling
+        const activeTasks = await getActiveTasks();
+        if (activeTasks.length > 0) {
+          console.log(`${activeTasks.length} task(s) already active on Kling, waiting...`);
+
+          // Poll for completion of the active task
+          const activeTask = activeTasks[0];
+          if (activeTask.klingTaskId) {
+            setProcessingStatus({
+              taskId: activeTask.taskId,
+              exerciseName: activeTask.exerciseName,
+              stage: 'waiting',
+              startedAt: new Date().toISOString(),
+            });
+
+            await pollUntilComplete(activeTask);
+            await loadTasks();
+          }
+          continue;
+        }
+
+        // Get next queued task
+        const queuedTasks = await getQueuedTasks();
+        if (queuedTasks.length === 0) {
+          console.log('Queue empty, stopping processor');
+          break;
+        }
+
+        const task = queuedTasks[0];
+        console.log(`Processing: ${task.exerciseName}`);
+
+        // Step 1: Download video (if needed)
+        let videoUrl = task.videoUrl;
+        if (!videoUrl) {
+          setProcessingStatus({
+            taskId: task.taskId,
+            exerciseName: task.exerciseName,
+            stage: 'downloading',
+            startedAt: new Date().toISOString(),
+          });
+
+          videoUrl = await downloadVideo(task);
+          if (!videoUrl) {
+            console.error(`Download failed for ${task.exerciseName}`);
+            await updateTask(task.taskId, { status: 'failed' });
+            await loadTasks();
+            continue;
+          }
+
+          // Save the downloaded URL
+          await updateTask(task.taskId, { videoUrl });
+        }
+
+        // Step 2: Submit to Kling
+        setProcessingStatus({
+          taskId: task.taskId,
+          exerciseName: task.exerciseName,
+          stage: 'submitting',
+          startedAt: new Date().toISOString(),
+        });
+
+        const positionImageUrl = getPositionImageUrlRef.current(task.positionId);
+        if (!positionImageUrl) {
+          console.error(`No position image for ${task.positionName}`);
+          await updateTask(task.taskId, { status: 'failed' });
+          await loadTasks();
+          continue;
+        }
+
+        try {
+          const processRes = await fetch('/api/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              imageUrl: positionImageUrl,
+              videoUrl,
+              characterOrientation: 'video',
+              mode: 'std',
+              keepOriginalSound: 'no',
+              prompt: task.customPrompt,
+            }),
+          });
+          const processData = await processRes.json();
+
+          if (!processRes.ok) {
+            throw new Error(processData.error || 'Kling API submission failed');
+          }
+
+          const klingTaskId = processData.taskId;
+          console.log(`Submitted to Kling: ${klingTaskId}`);
+
+          // Update task with Kling task ID and status
+          await updateTask(task.taskId, {
+            klingTaskId,
+            status: 'submitted',
+          });
+
+          await loadTasks();
+
+          // Step 3: Wait for Kling to complete
+          setProcessingStatus({
+            taskId: task.taskId,
+            exerciseName: task.exerciseName,
+            stage: 'waiting',
+            startedAt: new Date().toISOString(),
+          });
+
+          const updatedTask = { ...task, klingTaskId, videoUrl };
+          await pollUntilComplete(updatedTask);
+          await loadTasks();
+
+        } catch (err) {
+          console.error(`Kling submission failed for ${task.exerciseName}:`, err);
+          await updateTask(task.taskId, { status: 'failed' });
+          await loadTasks();
+        }
+      }
+    } finally {
+      isProcessingRef.current = false;
+      setProcessingStatus(null);
+    }
+  }, [loadTasks]);
+
+  // Download video from YouTube or use existing URL
+  async function downloadVideo(task: QueuedTask): Promise<string | undefined> {
+    try {
+      if (task.sourceYoutubeUrl) {
+        const body: Record<string, unknown> = { url: task.sourceYoutubeUrl };
+        if (task.sourceStartTime !== undefined) body.startTime = task.sourceStartTime;
+        if (task.sourceEndTime !== undefined) body.endTime = task.sourceEndTime;
+
+        const res = await fetch('/api/youtube-download-v2', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          console.log(`Downloaded: ${task.exerciseName}`);
+          return data.url;
+        } else {
+          console.error(`Download failed: ${data.error}`);
+          return undefined;
+        }
+      } else if (task.sourceInputUrl) {
+        return task.sourceInputUrl;
+      }
+      return undefined;
+    } catch (err) {
+      console.error('Download error:', err);
+      return undefined;
+    }
+  }
+
+  // Poll Kling until task completes
+  async function pollUntilComplete(task: QueuedTask): Promise<void> {
+    if (!task.klingTaskId) return;
+
+    const maxAttempts = 60; // 15 minutes max
+    let attempts = 0;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      await new Promise(resolve => setTimeout(resolve, 15000)); // 15 seconds
+
+      try {
+        const res = await fetch(`/api/process/${task.klingTaskId}`);
+        const data = await res.json();
+        console.log(`Poll ${attempts}: ${data.status}`);
+
+        if (data.status !== 'submitted') {
+          await updateTask(task.taskId, { status: data.status });
+        }
+
+        if (data.status === 'succeed' && data.videos?.[0]) {
+          await updateTask(task.taskId, {
+            status: 'succeed',
+            outputVideoUrl: data.videos[0].url,
+            videoDurationSec: parseFloat(data.videos[0].duration) || undefined,
+          });
+
+          // Auto-save to exercise library
+          try {
+            const updatedTask: QueuedTask = {
+              ...task,
+              status: 'succeed',
+              outputVideoUrl: data.videos[0].url,
+              videoDurationSec: parseFloat(data.videos[0].duration) || undefined,
+              videoUrl: task.videoUrl || '',
+            };
+            await autoSaveCompletedTask(updatedTask);
+            await updateTask(task.taskId, { autoSaved: true });
+            console.log(`Auto-saved: ${task.exerciseName}`);
+          } catch (saveErr) {
+            console.error('Auto-save failed:', saveErr);
+          }
+
+          // Remove from queue
+          await removeTask(task.taskId);
+          return;
+        }
+
+        if (data.status === 'failed') {
+          console.log(`Task failed: ${task.exerciseName}`);
+          return;
+        }
+      } catch (err) {
+        console.error('Poll error:', err);
+      }
+    }
+
+    console.log('Max poll attempts reached');
+  }
+
+  // Load tasks on mount and start processing if needed
+  useEffect(() => {
+    loadTasks().then((allTasks) => {
+      // Check if there are queued tasks or active tasks
+      const hasQueued = allTasks.some(t => t.status === 'queued');
+      const hasActive = allTasks.some(t => t.status === 'submitted' || t.status === 'processing');
+
+      if (hasQueued || hasActive) {
+        console.log('Found queued/active tasks, resuming processing...');
+        processQueue();
+      }
+    });
+  }, [loadTasks, processQueue]);
+
+  // Get queue items (queued, submitted, processing - NOT succeed/failed)
+  // Sort ascending: first item at top (by batch_position, then by started_at)
+  const queueItems = tasks
+    .filter(t => t.status === 'queued' || t.status === 'submitted' || t.status === 'processing')
+    .sort((a, b) => {
+      // First sort by batch_position (ascending)
+      if (a.batchPosition !== undefined && b.batchPosition !== undefined) {
+        return a.batchPosition - b.batchPosition;
+      }
+      // Fallback to started_at (ascending - oldest first)
+      return new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime();
+    });
+
+  // Get failed items
+  const failedItems = tasks.filter(t => t.status === 'failed');
+
+  return {
+    tasks,
+    queueItems,
+    failedItems,
+    loading,
+    processingStatus,
+    addToQueue,
+    loadTasks,
+    removeTask,
+  };
+}

@@ -1,0 +1,360 @@
+'use client';
+
+import {
+  createContext,
+  useContext,
+  useState,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from 'react';
+import { usePositions } from '@/hooks/usePositions';
+import { addTask, updateTask } from '@/lib/taskQueue';
+import { supabase } from '@/lib/supabase';
+import type { ExerciseTemplate } from '@/types';
+
+export interface SubmissionItem {
+  template: ExerciseTemplate;
+  status: 'pending' | 'submitted' | 'failed';
+  error?: string;
+  klingTaskId?: string;
+  batchId: string;
+  batchPosition: number;
+  batchTotal: number;
+}
+
+interface ProcessingProgress {
+  current: number;
+  total: number;
+  currentExercise: string;
+  stage: 'downloading' | 'submitting' | 'waiting';
+}
+
+interface BatchSubmissionContextValue {
+  items: SubmissionItem[];
+  isSubmitting: boolean;
+  reloadTrigger: number;
+  processingProgress: ProcessingProgress | null;
+  addBatch: (templates: ExerciseTemplate[]) => void;
+  retryFailed: (templateId: string) => void;
+  dismissItem: (templateId: string) => void;
+}
+
+const BatchSubmissionContext = createContext<BatchSubmissionContextValue | null>(null);
+
+// Check how many tasks are currently active on Kling
+async function getActiveKlingTaskCount(): Promise<number> {
+  const { data } = await supabase
+    .from('task_queue')
+    .select('id')
+    .in('status', ['submitted', 'processing']);
+  return data?.length ?? 0;
+}
+
+// Wait until there's a free slot (Kling limits concurrent tasks)
+async function waitForKlingSlot(maxActive = 2): Promise<void> {
+  while (true) {
+    const activeCount = await getActiveKlingTaskCount();
+    if (activeCount < maxActive) {
+      console.log(`Kling has ${activeCount} active tasks, slot available`);
+      return;
+    }
+    console.log(`Kling has ${activeCount} active tasks, waiting for slot...`);
+    await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10s
+  }
+}
+
+export function BatchSubmissionProvider({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<{ items: SubmissionItem[]; isSubmitting: boolean }>({
+    items: [],
+    isSubmitting: false,
+  });
+  const [reloadTrigger, setReloadTrigger] = useState(0);
+  const [processingProgress, setProcessingProgress] = useState<ProcessingProgress | null>(null);
+
+  const itemsRef = useRef<SubmissionItem[]>([]);
+  const isProcessingRef = useRef(false);
+  const { getPositionImageUrl } = usePositions();
+  const getPositionImageUrlRef = useRef(getPositionImageUrl);
+  getPositionImageUrlRef.current = getPositionImageUrl;
+
+  const updateItems = useCallback(
+    (updater: (items: SubmissionItem[]) => SubmissionItem[]) => {
+      const newItems = updater(itemsRef.current);
+      itemsRef.current = newItems;
+      setState((prev) => ({ ...prev, items: newItems }));
+    },
+    []
+  );
+
+  const addBatch = useCallback(
+    async (templates: ExerciseTemplate[]) => {
+      if (templates.length === 0) return;
+      if (isProcessingRef.current) {
+        console.log('Already processing, ignoring new batch');
+        return;
+      }
+
+      isProcessingRef.current = true;
+      setState((prev) => ({ ...prev, isSubmitting: true }));
+
+      const batchId = `batch-${Date.now()}`;
+      const newItems: SubmissionItem[] = templates.map((t, i) => ({
+        template: t,
+        status: 'pending' as const,
+        batchId,
+        batchPosition: i + 1,
+        batchTotal: templates.length,
+      }));
+
+      updateItems((items) => [...items, ...newItems]);
+
+      // ============================================
+      // Process each video ONE AT A TIME: download → submit → wait → next
+      // ============================================
+      console.log(`Processing ${templates.length} exercises one at a time...`);
+
+      for (let i = 0; i < templates.length; i++) {
+        const template = templates[i];
+        const item = itemsRef.current.find((it) => it.template.id === template.id);
+        if (!item) continue;
+
+        setProcessingProgress({
+          current: i + 1,
+          total: templates.length,
+          currentExercise: template.exerciseName,
+          stage: 'downloading',
+        });
+
+        // Step 1: Download the video
+        let videoUrl: string | null = null;
+        console.log(`[${i + 1}/${templates.length}] Downloading: ${template.exerciseName}`);
+
+        try {
+          if (template.youtubeUrl) {
+            const ytBody: Record<string, unknown> = { url: template.youtubeUrl };
+            if (template.startTime !== undefined) ytBody.startTime = template.startTime;
+            if (template.endTime !== undefined) ytBody.endTime = template.endTime;
+
+            const ytRes = await fetch('/api/youtube-download-v2', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(ytBody),
+            });
+            const ytData = await ytRes.json();
+            if (ytRes.ok) {
+              videoUrl = ytData.url;
+              console.log(`Downloaded: ${template.exerciseName}`);
+            } else {
+              console.error(`Download failed: ${template.exerciseName}`, ytData.error);
+            }
+          } else if (template.inputVideoUrl) {
+            videoUrl = template.inputVideoUrl;
+          }
+        } catch (err) {
+          console.error(`Download error: ${template.exerciseName}`, err);
+        }
+
+        // Skip if download failed
+        if (!videoUrl) {
+          console.error(`Skipping ${template.exerciseName} - download failed`);
+          updateItems((items) =>
+            items.map((it) =>
+              it.template.id === template.id
+                ? { ...it, status: 'failed' as const, error: 'Download failed' }
+                : it
+            )
+          );
+          continue;
+        }
+
+        try {
+          // Get position image URL
+          const positionImageUrl = getPositionImageUrlRef.current(template.positionId);
+          if (!positionImageUrl) {
+            throw new Error(`No image found for position "${template.positionName}"`);
+          }
+
+          // Wait for a free slot on Kling before submitting
+          setProcessingProgress((prev) => prev ? { ...prev, stage: 'submitting' } : null);
+          await waitForKlingSlot(1); // Only 1 task at a time
+
+          // Submit to Kling
+          console.log(`Submitting to Kling: ${template.exerciseName}`);
+
+          const processRes = await fetch('/api/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              imageUrl: positionImageUrl,
+              videoUrl,
+              characterOrientation: 'video',
+              mode: 'std',
+              keepOriginalSound: 'no',
+              prompt: template.customPrompt,
+            }),
+          });
+          const processData = await processRes.json();
+
+          if (!processRes.ok) {
+            throw new Error(processData.error || 'Kling API submission failed');
+          }
+
+          const taskId = processData.taskId;
+          console.log(`Kling accepted! Task ID: ${taskId}`);
+
+          // Save to task queue
+          await addTask({
+            taskId,
+            status: 'submitted',
+            videoUrl,
+            positionId: template.positionId || 'unknown',
+            positionName: template.positionName || 'Unknown',
+            mode: 'std',
+            exerciseName: template.exerciseName,
+            equipmentType: template.equipmentType,
+            customPrompt: template.customPrompt,
+            force: template.force,
+            mechanic: template.mechanic,
+            limbs: template.limbs,
+            body: template.body,
+            difficulty: template.difficulty,
+            musclesTargeted: template.musclesTargeted,
+            startedAt: new Date().toISOString(),
+            templateId: template.id,
+            batchId: item.batchId,
+            batchPosition: item.batchPosition,
+            batchTotal: item.batchTotal,
+          });
+
+          // Delete template
+          await supabase.from('exercise_templates').delete().eq('id', template.id);
+
+          // Mark as submitted
+          updateItems((items) =>
+            items.map((it) =>
+              it.template.id === template.id
+                ? { ...it, status: 'submitted' as const, klingTaskId: taskId }
+                : it
+            )
+          );
+
+          setReloadTrigger((prev) => prev + 1);
+
+          // ============================================
+          // Wait for Kling to finish before next one
+          // ============================================
+          if (i < templates.length - 1) {
+            setProcessingProgress((prev) => prev ? { ...prev, stage: 'waiting' } : null);
+            console.log(`Waiting for Kling to finish processing...`);
+
+            let attempts = 0;
+            const maxAttempts = 60; // 15 minutes max wait
+            while (attempts < maxAttempts) {
+              attempts++;
+              await new Promise((resolve) => setTimeout(resolve, 15000)); // 15 seconds
+
+              try {
+                const statusRes = await fetch(`/api/process/${taskId}`);
+                const statusData = await statusRes.json();
+                console.log(`Poll ${attempts}: ${statusData.status}`);
+
+                // Update task status in DB
+                if (statusData.status !== 'submitted') {
+                  await updateTask(taskId, { status: statusData.status });
+                  if (statusData.status === 'succeed' && statusData.videos?.[0]) {
+                    await updateTask(taskId, {
+                      outputVideoUrl: statusData.videos[0].url,
+                      videoDurationSec: parseFloat(statusData.videos[0].duration) || undefined,
+                    });
+                  }
+                }
+
+                if (statusData.status === 'succeed' || statusData.status === 'failed') {
+                  console.log(`Task completed: ${statusData.status}`);
+                  setReloadTrigger((prev) => prev + 1);
+                  break;
+                }
+              } catch (pollErr) {
+                console.error('Poll error:', pollErr);
+              }
+            }
+
+            if (attempts >= maxAttempts) {
+              console.log('Max wait time reached, proceeding...');
+            }
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : 'Submission failed';
+          console.error(`FAILED: ${template.exerciseName} - ${errMsg}`);
+          updateItems((items) =>
+            items.map((it) =>
+              it.template.id === template.id
+                ? { ...it, status: 'failed' as const, error: errMsg }
+                : it
+            )
+          );
+        }
+      }
+
+      // ============================================
+      // DONE
+      // ============================================
+      console.log('\n========== ALL ITEMS PROCESSED ==========');
+      updateItems((items) => items.filter((it) => it.status !== 'submitted'));
+      isProcessingRef.current = false;
+      setState((prev) => ({ ...prev, isSubmitting: false }));
+      setProcessingProgress(null);
+    },
+    [updateItems]
+  );
+
+  const retryFailed = useCallback(
+    (templateId: string) => {
+      const item = itemsRef.current.find((it) => it.template.id === templateId);
+      if (!item || item.status !== 'failed') return;
+
+      updateItems((items) =>
+        items.map((it) =>
+          it.template.id === templateId
+            ? { ...it, status: 'pending' as const, error: undefined }
+            : it
+        )
+      );
+
+      addBatch([item.template]);
+    },
+    [updateItems, addBatch]
+  );
+
+  const dismissItem = useCallback(
+    (templateId: string) => {
+      updateItems((items) => items.filter((it) => it.template.id !== templateId));
+    },
+    [updateItems]
+  );
+
+  return (
+    <BatchSubmissionContext.Provider
+      value={{
+        items: state.items,
+        isSubmitting: state.isSubmitting,
+        reloadTrigger,
+        processingProgress,
+        addBatch,
+        retryFailed,
+        dismissItem,
+      }}
+    >
+      {children}
+    </BatchSubmissionContext.Provider>
+  );
+}
+
+export function useBatchSubmission() {
+  const context = useContext(BatchSubmissionContext);
+  if (!context) {
+    throw new Error('useBatchSubmission must be used within BatchSubmissionProvider');
+  }
+  return context;
+}

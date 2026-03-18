@@ -1,0 +1,14 @@
+{
+  "framework": "nextjs",
+  "functions": {
+    "src/app/api/youtube-download/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/youtube-download-v2/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/download-hls/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}
