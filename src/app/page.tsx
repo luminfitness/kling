@@ -359,6 +359,7 @@ export default function LibraryPage() {
     [exercises]
   );
 
+  const [completedExpanded, setCompletedExpanded] = useState(false);
   const loading = loadingExercises;
 
   if (loading) {
@@ -414,35 +415,38 @@ export default function LibraryPage() {
           </button>
         </div>
       ) : (
-        <>
-          <div className="space-y-4">
-            {/* Pending Templates */}
-            {sortedTemplates.length > 0 && (
-              <div className="relative z-20">
-                <TemplateTable
-                  templates={sortedTemplates}
-                  selectedIds={selectedTemplates}
-                  onSelectionChange={handleTemplateSelectionChange}
-                  onUpdateTemplate={updateTemplate}
-                  onDeleteTemplate={deleteTemplate}
-                  onEditTemplate={handleEditTemplate}
-                  onDuplicateTemplate={handleDuplicateTemplate}
-                  onAddNewTemplate={handleAddNewTemplate}
-                  positions={positions}
-                  equipmentOptions={allEquipmentNames}
-                  sortColumn={tableSortColumn}
-                  sortDirection={tableSortDirection}
-                  onSort={handleTableSort}
-                  onBatchOutput={handleBatchOutput}
-                  onBatchAssignPositions={() => setBatchAssignPositionsOpen(true)}
-                  onCreatePosition={createPosition}
-                />
-              </div>
-            )}
+        <div className="flex gap-4 items-start">
+          {/* Pending Templates — left column */}
+          {sortedTemplates.length > 0 && (
+            <div className="relative z-20 w-[520px] flex-shrink-0">
+              <TemplateTable
+                templates={sortedTemplates}
+                selectedIds={selectedTemplates}
+                onSelectionChange={handleTemplateSelectionChange}
+                onUpdateTemplate={updateTemplate}
+                onDeleteTemplate={deleteTemplate}
+                onEditTemplate={handleEditTemplate}
+                onDuplicateTemplate={handleDuplicateTemplate}
+                onAddNewTemplate={handleAddNewTemplate}
+                positions={positions}
+                equipmentOptions={allEquipmentNames}
+                sortColumn={tableSortColumn}
+                sortDirection={tableSortDirection}
+                onSort={handleTableSort}
+                onBatchOutput={handleBatchOutput}
+                onBatchAssignPositions={() => setBatchAssignPositionsOpen(true)}
+                onCreatePosition={createPosition}
+              />
+            </div>
+          )}
 
-            {/* Completed Exercises */}
-            {sortedExercises.length > 0 && (
-              <div className="relative z-10">
+          {/* Completed Exercises — right column, collapsible */}
+          {sortedExercises.length > 0 && (
+            <div className="relative z-10 flex-1 min-w-0">
+              <div
+                className="overflow-hidden transition-all duration-300"
+                style={{ maxHeight: completedExpanded ? 'none' : '480px' }}
+              >
                 <ExerciseTable
                   exercises={sortedExercises}
                   onUpdate={updateExercise}
@@ -468,9 +472,21 @@ export default function LibraryPage() {
                   onAddCustomPosition={() => setShowPositionModal(true)}
                 />
               </div>
-            )}
-          </div>
-        </>
+              {/* Expand / Collapse button */}
+              {sortedExercises.length > 8 && (
+                <button
+                  onClick={() => setCompletedExpanded(e => !e)}
+                  className="mt-2 w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-gray-200 bg-white text-xs font-medium text-gray-500 hover:bg-gray-50 hover:text-gray-700 transition-colors"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className={`h-3.5 w-3.5 transition-transform ${completedExpanded ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  </svg>
+                  {completedExpanded ? `Collapse` : `Show all ${sortedExercises.length} completed`}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       )}
 
       {/* Modals */}

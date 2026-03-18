@@ -15,10 +15,12 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className="min-h-screen bg-gray-50 text-gray-900 antialiased">
+      <body className="flex h-screen overflow-hidden bg-gray-50 text-gray-900 antialiased">
         <AppProviders>
           <NavBar />
-          <main className="mx-auto max-w-[1800px] px-4 py-6">{children}</main>
+          <div className="flex-1 overflow-y-auto">
+            <main className="px-6 py-6">{children}</main>
+          </div>
         </AppProviders>
       </body>
     </html>
