@@ -1,12 +1,17 @@
 'use client';
 
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { findLoopPoints, findLoopPointsMADOnly, type LoopCandidate, type FrameExtractionProgress } from '@/lib/loopFinder';
 import { trimVideoWithCrossfade } from '@/lib/videoTrimmer';
 import { trimVideoWithFlowBlend } from '@/lib/flowBlend';
 import { supabase } from '@/lib/supabase';
+import { uploadToStorage } from '@/lib/supabaseStorage';
+import { useLoopResults } from '@/hooks/useLoopResults';
 import BatchProcessingModal from '@/components/BatchProcessingModal';
 import BatchReviewCarousel from '@/components/BatchReviewCarousel';
+import LoopUploadModal from '@/components/LoopUploadModal';
+import LoopResultsTable from '@/components/LoopResultsTable';
+import type { LoopExerciseSummary } from '@/types';
 
 // ─── Batch Types ─────────────────────────────────────────────────────────────
 
@@ -48,7 +53,16 @@ export default function LoopFinderPage() {
   const [batchErrorCount, setBatchErrorCount] = useState(0);
   const [batchStartTime, setBatchStartTime] = useState(0);
   const [batchElapsedMs, setBatchElapsedMs] = useState(0);
-  const batchFileInputRef = useRef<HTMLInputElement>(null);
+
+  // ─── Upload Modal State ────────────────────────────────────────────────
+  const [showUploadModal, setShowUploadModal] = useState(false);
+
+  // ─── Review State ──────────────────────────────────────────────────────
+  const [reviewMode, setReviewMode] = useState<'none' | 'single' | 'batch'>('none');
+  const [reviewExerciseName, setReviewExerciseName] = useState<string | null>(null);
+
+  // ─── Supabase Results Hook ─────────────────────────────────────────────
+  const loopResults = useLoopResults();
 
   // ─── Single-Video State ──────────────────────────────────────────────────
   const [stage, setStage] = useState<Stage>('idle');
@@ -69,23 +83,15 @@ export default function LoopFinderPage() {
     const videoFiles = Array.from(files).filter((f) => f.type.startsWith('video/'));
     if (videoFiles.length === 0) return;
 
-    // Deduplicate names
     const nameCounts = new Map<string, number>();
     const exercises: BatchExercise[] = videoFiles.map((file) => {
       const baseName = file.name.replace(/\.[^.]+$/, '');
       const count = (nameCounts.get(baseName) || 0) + 1;
       nameCounts.set(baseName, count);
       const name = count > 1 ? `${baseName}_${count}` : baseName;
-      return {
-        name,
-        file,
-        status: 'pending' as const,
-        candidates: [],
-        flagged: false,
-      };
+      return { name, file, status: 'pending' as const, candidates: [], flagged: false };
     });
 
-    // Second pass: fix first occurrence if there were duplicates
     const finalExercises = exercises.map((e) => {
       const baseName = e.file.name.replace(/\.[^.]+$/, '');
       if ((nameCounts.get(baseName) || 0) > 1 && !e.name.includes('_')) {
@@ -97,9 +103,10 @@ export default function LoopFinderPage() {
     setBatchExercises(finalExercises);
   }, []);
 
-  // ─── Batch: Process all videos ───────────────────────────────────────────
+  // ─── Batch: Process all videos with Supabase persistence ───────────────
 
   const processBatch = async () => {
+    setShowUploadModal(false);
     setBatchStage('processing');
     setBatchCurrentIdx(0);
     setBatchErrorCount(0);
@@ -119,7 +126,6 @@ export default function LoopFinderPage() {
       const sourceUrl = URL.createObjectURL(updated[i].file);
 
       try {
-        // Find loop points (MAD only)
         console.log(`[Batch] Processing ${updated[i].name} (${i + 1}/${updated.length})...`);
         const candidates = await findLoopPointsMADOnly(sourceUrl, (p) => {
           if (p.stage === 'extracting' && p.current % 20 === 0) {
@@ -127,23 +133,69 @@ export default function LoopFinderPage() {
           }
         });
 
-        // Generate crossfade variants for each candidate
         const batchCandidates: BatchCandidate[] = [];
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 
         for (const c of candidates) {
           let url1f: string | null = null;
           let url3f: string | null = null;
 
+          // Generate 1f crossfade
           try {
             const blob1f = await trimVideoWithCrossfade(sourceUrl, c.startTime, c.endTime, 1 / FPS);
-            url1f = URL.createObjectURL(blob1f);
+            // Upload to Supabase Storage
+            const storagePath = `loop-results/${updated[i].name}/${timestamp}/rank${c.rank}_1f.mp4`;
+            const publicUrl = await uploadToStorage('loop-results', storagePath, blob1f, 'video/mp4');
+            url1f = publicUrl;
+
+            // Insert row into loop_results_v2
+            await supabase.from('loop_results_v2').insert({
+              exercise_name: updated[i].name,
+              method: 'MAD',
+              rank: c.rank,
+              score: c.score,
+              start_time: c.startTime,
+              end_time: c.endTime,
+              loop_duration: c.duration,
+              algorithm: 'crossfade',
+              fade_frames: 1,
+              video_url: publicUrl,
+              rating: null,
+              reviewed: false,
+              flagged: false,
+              keeper: false,
+              downloaded: false,
+            });
+            console.log(`[Batch] ${updated[i].name} #${c.rank} 1f uploaded`);
           } catch (err) {
             console.error(`1f crossfade failed for ${updated[i].name} #${c.rank}:`, err);
           }
 
+          // Generate 3f crossfade
           try {
             const blob3f = await trimVideoWithCrossfade(sourceUrl, c.startTime, c.endTime, 3 / FPS);
-            url3f = URL.createObjectURL(blob3f);
+            const storagePath = `loop-results/${updated[i].name}/${timestamp}/rank${c.rank}_3f.mp4`;
+            const publicUrl = await uploadToStorage('loop-results', storagePath, blob3f, 'video/mp4');
+            url3f = publicUrl;
+
+            await supabase.from('loop_results_v2').insert({
+              exercise_name: updated[i].name,
+              method: 'MAD',
+              rank: c.rank,
+              score: c.score,
+              start_time: c.startTime,
+              end_time: c.endTime,
+              loop_duration: c.duration,
+              algorithm: 'crossfade',
+              fade_frames: 3,
+              video_url: publicUrl,
+              rating: null,
+              reviewed: false,
+              flagged: false,
+              keeper: false,
+              downloaded: false,
+            });
+            console.log(`[Batch] ${updated[i].name} #${c.rank} 3f uploaded`);
           } catch (err) {
             console.error(`3f crossfade failed for ${updated[i].name} #${c.rank}:`, err);
           }
@@ -159,7 +211,7 @@ export default function LoopFinderPage() {
           });
         }
 
-        console.log(`[Batch] ${updated[i].name}: done — ${batchCandidates.length} candidates`);
+        console.log(`[Batch] ${updated[i].name}: done — ${batchCandidates.length} candidates, all persisted to Supabase`);
         updated[i] = { ...updated[i], status: 'done', candidates: batchCandidates };
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -169,27 +221,63 @@ export default function LoopFinderPage() {
         setBatchErrorCount(errorCount);
       }
 
-      // Revoke source URL (keep output blob URLs)
       URL.revokeObjectURL(sourceUrl);
       setBatchExercises([...updated]);
     }
 
     setBatchElapsedMs(Date.now() - startTime);
+    // Refresh results from Supabase, then go to review
+    await loopResults.refresh();
     setBatchStage('review');
   };
 
   const resetBatch = () => {
-    // Revoke all blob URLs
-    for (const ex of batchExercises) {
-      for (const c of ex.candidates) {
-        if (c.url1f) URL.revokeObjectURL(c.url1f);
-        if (c.url3f) URL.revokeObjectURL(c.url3f);
-      }
-    }
     setBatchExercises([]);
     setBatchStage('idle');
     setBatchCurrentIdx(0);
     setBatchErrorCount(0);
+    setReviewMode('none');
+    setReviewExercises([]);
+  };
+
+  // ─── Review handlers ───────────────────────────────────────────────────
+
+  const handleReviewExercise = (exerciseName: string) => {
+    setReviewExerciseName(exerciseName);
+    setReviewMode('single');
+  };
+
+  const handleBatchReview = () => {
+    setReviewMode('batch');
+  };
+
+  const handleDownloadExercise = (exercise: LoopExerciseSummary) => {
+    // Download keeper if exists, otherwise download all
+    const toDownload = exercise.hasKeeper
+      ? exercise.rows.filter((r) => r.keeper)
+      : exercise.rows;
+
+    for (const row of toDownload) {
+      const a = document.createElement('a');
+      a.href = row.video_url;
+      a.download = `${exercise.exerciseName}_rank${row.rank}_${row.fade_frames}f.mp4`;
+      a.target = '_blank';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+  };
+
+  const handleReviewBack = () => {
+    setReviewMode('none');
+    setReviewExerciseName(null);
+    loopResults.refresh();
+  };
+
+  // After batch processing completes → go to review via Supabase data
+  const handleBatchProcessingReview = () => {
+    resetBatch();
+    // The table will show results from the hook
   };
 
   // ─── Single-Video Handlers (unchanged) ───────────────────────────────────
@@ -362,79 +450,113 @@ export default function LoopFinderPage() {
 
   const ratedCount = Object.keys(ratings).length;
 
+  // ─── Derive review exercises from hook data ─────────────────────────────
+  const derivedReviewExercises = reviewMode === 'single' && reviewExerciseName
+    ? loopResults.exercises.filter((e) => e.exerciseName === reviewExerciseName)
+    : reviewMode === 'batch'
+    ? loopResults.exercises.filter((e) => !e.reviewed || e.flagged)
+    : [];
+
+  // ─── Review Mode (full page) ──────────────────────────────────────────
+  if (reviewMode !== 'none') {
+    return (
+      <div className="max-w-6xl mx-auto px-4 py-12 space-y-4">
+        <BatchReviewCarousel
+          exercises={derivedReviewExercises}
+          onSetKeeper={loopResults.setKeeper}
+          onClearKeeper={loopResults.clearKeeper}
+          onToggleFlag={loopResults.toggleFlag}
+          onMarkReviewed={loopResults.markReviewed}
+          onMarkDownloaded={loopResults.markDownloaded}
+          onUpdateRating={loopResults.updateRating}
+          onUpdate={() => loopResults.refresh()}
+          onBack={handleReviewBack}
+        />
+      </div>
+    );
+  }
+
+  // ─── Batch processing review (after processing completes, show results from Supabase) ──
+  if (batchStage === 'review') {
+    // Use the Supabase-backed results for review
+    const processedNames = new Set(batchExercises.filter((e) => e.status === 'done').map((e) => e.name));
+    const justProcessed = loopResults.exercises.filter((e) => processedNames.has(e.exerciseName));
+
+    return (
+      <div className="max-w-6xl mx-auto px-4 py-12 space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-xl font-semibold text-gray-900 mb-1">Processing Complete</h1>
+            <p className="text-sm text-gray-500">
+              {batchExercises.filter((e) => e.status === 'done').length} videos processed,{' '}
+              {batchErrorCount} error{batchErrorCount !== 1 ? 's' : ''}
+            </p>
+          </div>
+          <button
+            onClick={handleBatchProcessingReview}
+            className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+          >
+            Back to Results
+          </button>
+        </div>
+
+        {justProcessed.length > 0 && (
+          <BatchReviewCarousel
+            exercises={justProcessed}
+            onSetKeeper={loopResults.setKeeper}
+            onClearKeeper={loopResults.clearKeeper}
+            onToggleFlag={loopResults.toggleFlag}
+            onMarkReviewed={loopResults.markReviewed}
+            onMarkDownloaded={loopResults.markDownloaded}
+            onUpdateRating={loopResults.updateRating}
+            onUpdate={() => loopResults.refresh()}
+            onBack={handleBatchProcessingReview}
+          />
+        )}
+      </div>
+    );
+  }
+
+  // ─── Main Page Layout ──────────────────────────────────────────────────
   return (
     <div className="max-w-6xl mx-auto px-4 py-12 space-y-8">
-      <div>
-        <h1 className="text-xl font-semibold text-gray-900 mb-1">Video Loop Finder</h1>
-        <p className="text-sm text-gray-500">
-          Batch process exercise videos to find loop points and generate crossfade variants.
-        </p>
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-semibold text-gray-900 mb-1">Video Loop Finder</h1>
+          <p className="text-sm text-gray-500">
+            Batch process and review exercise loop videos
+          </p>
+        </div>
+        <button
+          onClick={() => setShowUploadModal(true)}
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
+        >
+          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+          </svg>
+          Upload
+        </button>
       </div>
 
-      {/* ─── Batch Mode ─── */}
+      {/* Results Table */}
+      <LoopResultsTable
+        exercises={loopResults.exercises}
+        loading={loopResults.loading}
+        onReview={handleReviewExercise}
+        onBatchReview={handleBatchReview}
+        onDownload={handleDownloadExercise}
+      />
 
-      {batchStage === 'idle' && (
-        <div className="space-y-4">
-          {/* Batch upload area */}
-          <div
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              if (e.dataTransfer.files.length > 0) handleBatchFiles(e.dataTransfer.files);
-            }}
-            onClick={() => batchFileInputRef.current?.click()}
-            className="border-2 border-dashed border-gray-300 rounded-xl p-12 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50/50 transition-colors"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-10 w-10 mx-auto text-gray-400 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-            </svg>
-            <p className="text-sm text-gray-600 font-medium">Drop exercise videos here or click to browse</p>
-            <p className="text-xs text-gray-400 mt-1">Select multiple MP4/MOV files for batch processing</p>
-            <input
-              ref={batchFileInputRef}
-              type="file"
-              accept="video/*"
-              multiple
-              className="hidden"
-              onChange={(e) => e.target.files && e.target.files.length > 0 && handleBatchFiles(e.target.files)}
-            />
-          </div>
-
-          {/* Selected files list */}
-          {batchExercises.length > 0 && (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <p className="text-sm font-medium text-gray-700">
-                  {batchExercises.length} video{batchExercises.length > 1 ? 's' : ''} selected
-                </p>
-                <div className="flex gap-2">
-                  <button
-                    onClick={resetBatch}
-                    className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
-                  >
-                    Clear
-                  </button>
-                  <button
-                    onClick={processBatch}
-                    className="px-5 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
-                  >
-                    Process All
-                  </button>
-                </div>
-              </div>
-              <div className="max-h-60 overflow-y-auto border border-gray-200 rounded-lg divide-y divide-gray-100">
-                {batchExercises.map((ex, i) => (
-                  <div key={i} className="px-3 py-2 text-sm text-gray-600 flex items-center justify-between">
-                    <span className="truncate">{ex.name}</span>
-                    <span className="text-xs text-gray-400 ml-2 shrink-0">
-                      {(ex.file.size / 1024 / 1024).toFixed(1)} MB
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
+      {/* Upload Modal */}
+      {showUploadModal && (
+        <LoopUploadModal
+          onClose={() => { setShowUploadModal(false); setBatchExercises([]); }}
+          onFilesSelected={handleBatchFiles}
+          onProcess={processBatch}
+          exercises={batchExercises}
+          onClear={() => setBatchExercises([])}
+        />
       )}
 
       {/* Batch processing modal */}
@@ -445,15 +567,6 @@ export default function LoopFinderPage() {
           currentName={batchExercises[batchCurrentIdx]?.name || ''}
           errorCount={batchErrorCount}
           elapsedMs={batchElapsedMs}
-        />
-      )}
-
-      {/* Batch review carousel */}
-      {batchStage === 'review' && (
-        <BatchReviewCarousel
-          exercises={batchExercises}
-          onUpdateExercises={setBatchExercises}
-          onBack={resetBatch}
         />
       )}
 
@@ -563,359 +676,8 @@ export default function LoopFinderPage() {
               />
             </div>
           )}
-
-          {/* Processed Results (from Python pipeline) */}
-          <ProcessedResultsSection />
         </div>
       </details>
-    </div>
-  );
-}
-
-// ─── Processed Results Viewer ─────────────────────────────────────────────────
-
-interface LoopResult {
-  id: string;
-  exercise_name: string;
-  method: string;
-  rank: number;
-  score: number;
-  start_time: number;
-  end_time: number;
-  loop_duration: number;
-  algorithm: string;
-  fade_frames: number;
-  video_url: string;
-  rating: string | null;
-  source_video_url: string | null;
-  created_at: string;
-}
-
-function extractFrameFromVideo(videoUrl: string, time: number): Promise<string | null> {
-  return new Promise((resolve) => {
-    const video = document.createElement('video');
-    video.crossOrigin = 'anonymous';
-    video.muted = true;
-    video.preload = 'auto';
-
-    const cleanup = () => {
-      video.removeEventListener('seeked', onSeeked);
-      video.removeEventListener('error', onError);
-      video.src = '';
-      video.load();
-    };
-
-    const onSeeked = () => {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(video, 0, 0);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-          cleanup();
-          resolve(dataUrl);
-        } else {
-          cleanup();
-          resolve(null);
-        }
-      } catch {
-        cleanup();
-        resolve(null);
-      }
-    };
-
-    const onError = () => {
-      cleanup();
-      resolve(null);
-    };
-
-    video.addEventListener('seeked', onSeeked, { once: true });
-    video.addEventListener('error', onError, { once: true });
-    video.src = videoUrl;
-    video.load();
-    video.addEventListener('loadedmetadata', () => {
-      video.currentTime = time;
-    }, { once: true });
-  });
-}
-
-function ProcessedResultsSection() {
-  const [exerciseNames, setExerciseNames] = useState<string[]>([]);
-  const [selectedExercise, setSelectedExercise] = useState<string>('');
-  const [results, setResults] = useState<LoopResult[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [frameCache, setFrameCache] = useState<Record<string, string | null>>({});
-
-  useEffect(() => {
-    (async () => {
-      const { data } = await supabase
-        .from('loop_results_v2')
-        .select('exercise_name')
-        .order('created_at', { ascending: false });
-      if (data) {
-        const unique = Array.from(new Set(data.map((r: { exercise_name: string }) => r.exercise_name)));
-        setExerciseNames(unique);
-      }
-    })();
-  }, []);
-
-  useEffect(() => {
-    if (!selectedExercise) {
-      setResults([]);
-      setFrameCache({});
-      return;
-    }
-    (async () => {
-      setLoading(true);
-      const { data } = await supabase
-        .from('loop_results_v2')
-        .select('*')
-        .eq('exercise_name', selectedExercise)
-        .order('method')
-        .order('rank')
-        .order('algorithm')
-        .order('fade_frames');
-      setResults(data || []);
-      setLoading(false);
-    })();
-  }, [selectedExercise]);
-
-  useEffect(() => {
-    if (results.length === 0) return;
-
-    const seen = new Set<string>();
-    const toExtract: { key: string; url: string; time: number }[] = [];
-
-    for (const r of results) {
-      if (!r.source_video_url) continue;
-      const startKey = `${r.method}-${r.rank}-start`;
-      const endKey = `${r.method}-${r.rank}-end`;
-      if (!seen.has(startKey)) {
-        seen.add(startKey);
-        toExtract.push({ key: startKey, url: r.source_video_url, time: r.start_time });
-      }
-      if (!seen.has(endKey)) {
-        seen.add(endKey);
-        toExtract.push({ key: endKey, url: r.source_video_url, time: r.end_time });
-      }
-    }
-
-    (async () => {
-      for (const { key, url, time } of toExtract) {
-        if (frameCache[key] !== undefined) continue;
-        const dataUrl = await extractFrameFromVideo(url, time);
-        setFrameCache((prev) => ({ ...prev, [key]: dataUrl }));
-      }
-    })();
-  }, [results]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const deduped = (() => {
-    const seen = new Map<string, LoopResult>();
-    for (const r of results) {
-      const key = `${r.method}-${r.rank}-${r.algorithm}-${r.fade_frames}`;
-      const existing = seen.get(key);
-      if (!existing || r.created_at > existing.created_at) {
-        seen.set(key, r);
-      }
-    }
-    return Array.from(seen.values());
-  })();
-
-  const filtered = deduped.filter((r) => !(r.algorithm === 'crossfade' && r.fade_frames === 2));
-
-  const grouped = filtered.reduce<Record<string, Record<number, LoopResult[]>>>((acc, r) => {
-    const key = `${r.method}`;
-    if (!acc[key]) acc[key] = {};
-    if (!acc[key][r.rank]) acc[key][r.rank] = [];
-    acc[key][r.rank].push(r);
-    return acc;
-  }, {});
-
-  const [candidateRatings, setCandidateRatings] = useState<Record<string, 'good' | 'bad'>>({});
-
-  useEffect(() => {
-    const stored = localStorage.getItem('loop_candidate_ratings');
-    if (stored) setCandidateRatings(JSON.parse(stored));
-  }, []);
-
-  const handleCandidateRate = (key: string, rating: 'good' | 'bad') => {
-    setCandidateRatings((prev) => {
-      const next = { ...prev };
-      if (next[key] === rating) {
-        delete next[key];
-      } else {
-        next[key] = rating;
-      }
-      localStorage.setItem('loop_candidate_ratings', JSON.stringify(next));
-      return next;
-    });
-  };
-
-  const handleRate = async (id: string, rating: 'good' | 'bad') => {
-    const current = results.find((r) => r.id === id);
-    const newRating = current?.rating === rating ? null : rating;
-    await supabase.from('loop_results_v2').update({ rating: newRating }).eq('id', id);
-    setResults((prev) => prev.map((r) => r.id === id ? { ...r, rating: newRating } : r));
-  };
-
-  if (exerciseNames.length === 0) return null;
-
-  return (
-    <div className="border-t border-gray-200 pt-8 space-y-4">
-      <div>
-        <h2 className="text-lg font-semibold text-gray-900 mb-1">Processed Results</h2>
-        <p className="text-sm text-gray-500">Results from the Python morph cut pipeline</p>
-      </div>
-
-      <select
-        value={selectedExercise}
-        onChange={(e) => setSelectedExercise(e.target.value)}
-        className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 bg-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-      >
-        <option value="">Select an exercise...</option>
-        {exerciseNames.map((name) => (
-          <option key={name} value={name}>{name}</option>
-        ))}
-      </select>
-
-      {loading && (
-        <div className="flex items-center gap-2 text-sm text-gray-500">
-          <Spinner /> Loading results...
-        </div>
-      )}
-
-      {selectedExercise && !loading && filtered.length > 0 && (
-        <div className="space-y-6">
-          {Object.entries(grouped).map(([method, ranks]) => (
-            <div key={method} className="space-y-3">
-              <h3 className="font-semibold text-gray-900">{method}</h3>
-              {Object.entries(ranks).map(([rank, items]) => {
-                const first = items[0];
-                const startFrameKey = `${method}-${rank}-start`;
-                const endFrameKey = `${method}-${rank}-end`;
-                const startFrame = frameCache[startFrameKey];
-                const endFrame = frameCache[endFrameKey];
-                const candidateKey = `${selectedExercise}-${method}-${rank}`;
-                const candidateRating = candidateRatings[candidateKey];
-
-                return (
-                  <div key={rank} className="border border-gray-200 rounded-xl p-3 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-semibold text-gray-500">#{rank}</span>
-                      <span className="text-xs font-mono text-gray-600">
-                        {first.start_time}s&rarr;{first.end_time}s ({first.loop_duration}s)
-                      </span>
-                      <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-800">
-                        {(first.score * 100).toFixed(1)}%
-                      </span>
-                    </div>
-
-                    <div className="flex gap-3">
-                      <div className="shrink-0" style={{ width: '16%' }}>
-                        <p className="text-[10px] font-medium text-gray-500 text-center mb-0.5">Start</p>
-                        {startFrame ? (
-                          <img src={startFrame} alt="Start" className="w-full rounded-lg border border-gray-200 aspect-[9/16] object-cover bg-black" />
-                        ) : startFrame === null ? (
-                          <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center text-xs text-gray-400">N/A</div>
-                        ) : (
-                          <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center"><Spinner /></div>
-                        )}
-                        <div className="flex items-center justify-center gap-1 mt-0.5">
-                          <p className="text-[9px] text-gray-400">{first.start_time}s</p>
-                          <button
-                            onClick={() => handleCandidateRate(candidateKey, 'good')}
-                            className={`p-0.5 rounded transition-colors ${
-                              candidateRating === 'good' ? 'bg-green-200 text-green-800' : 'text-gray-300 hover:text-green-600'
-                            }`}
-                          >
-                            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M14 10h4.764a2 2 0 011.789 2.894l-3.5 7A2 2 0 0115.263 21h-4.017c-.163 0-.326-.02-.485-.06L7 20m7-10V5a2 2 0 00-2-2h-.095c-.5 0-.905.405-.905.905 0 .714-.211 1.412-.608 2.006L7 11v9m7-10h-2M7 20H5a2 2 0 01-2-2v-6a2 2 0 012-2h2.5" />
-                            </svg>
-                          </button>
-                          <button
-                            onClick={() => handleCandidateRate(candidateKey, 'bad')}
-                            className={`p-0.5 rounded transition-colors ${
-                              candidateRating === 'bad' ? 'bg-red-200 text-red-800' : 'text-gray-300 hover:text-red-600'
-                            }`}
-                          >
-                            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018c.163 0 .326.02.485.06L17 4m-7 10v2a3.5 3.5 0 003.5 3.5h.792c.458 0 .828-.37.828-.828 0-.714.211-1.412.608-2.006L17 13V4m-7 10h2m5-6h2a2 2 0 012 2v6a2 2 0 01-2 2h-2.5" />
-                            </svg>
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="shrink-0" style={{ width: '16%' }}>
-                        <p className="text-[10px] font-medium text-gray-500 text-center mb-0.5">End</p>
-                        {endFrame ? (
-                          <img src={endFrame} alt="End" className="w-full rounded-lg border border-gray-200 aspect-[9/16] object-cover bg-black" />
-                        ) : endFrame === null ? (
-                          <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center text-xs text-gray-400">N/A</div>
-                        ) : (
-                          <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center"><Spinner /></div>
-                        )}
-                        <p className="text-[9px] text-gray-400 mt-0.5 text-center">{first.end_time}s</p>
-                      </div>
-
-                      <div className="flex-1 grid grid-cols-4 gap-1.5">
-                        {items.slice(0, 8).map((r) => (
-                          <div key={r.id}>
-                            <video
-                              src={r.video_url}
-                              loop
-                              autoPlay
-                              muted
-                              playsInline
-                              className="w-full rounded aspect-[9/16] object-contain bg-black"
-                            />
-                            <p className="text-[8px] font-medium text-gray-600 text-center">{r.algorithm} {r.fade_frames}f</p>
-                            <div className="flex justify-center gap-0.5">
-                              <button
-                                onClick={() => handleRate(r.id, 'good')}
-                                className={`p-0.5 rounded transition-colors ${
-                                  r.rating === 'good' ? 'bg-green-200 text-green-800' : 'text-gray-300 hover:text-green-600'
-                                }`}
-                              >
-                                <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                  <path strokeLinecap="round" strokeLinejoin="round" d="M14 10h4.764a2 2 0 011.789 2.894l-3.5 7A2 2 0 0115.263 21h-4.017c-.163 0-.326-.02-.485-.06L7 20m7-10V5a2 2 0 00-2-2h-.095c-.5 0-.905.405-.905.905 0 .714-.211 1.412-.608 2.006L7 11v9m7-10h-2M7 20H5a2 2 0 01-2-2v-6a2 2 0 012-2h2.5" />
-                                </svg>
-                              </button>
-                              <button
-                                onClick={() => handleRate(r.id, 'bad')}
-                                className={`p-0.5 rounded transition-colors ${
-                                  r.rating === 'bad' ? 'bg-red-200 text-red-800' : 'text-gray-300 hover:text-red-600'
-                                }`}
-                              >
-                                <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                                  <path strokeLinecap="round" strokeLinejoin="round" d="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018c.163 0 .326.02.485.06L17 4m-7 10v2a3.5 3.5 0 003.5 3.5h.792c.458 0 .828-.37.828-.828 0-.714.211-1.412.608-2.006L17 13V4m-7 10h2m5-6h2a2 2 0 012 2v6a2 2 0 01-2 2h-2.5" />
-                                </svg>
-                              </button>
-                              <a
-                                href={r.video_url}
-                                download
-                                className="p-0.5 rounded text-gray-300 hover:text-gray-600 transition-colors"
-                                title="Download"
-                              >
-                                <DownloadIcon />
-                              </a>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {selectedExercise && !loading && filtered.length === 0 && (
-        <p className="text-sm text-gray-400">No results found for this exercise.</p>
-      )}
     </div>
   );
 }

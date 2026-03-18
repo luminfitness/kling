@@ -210,6 +210,40 @@ export interface DropboxVideo {
   updatedAt: string;
 }
 
+// --- Loop Result types ---
+
+export interface LoopResultRow {
+  id: string;
+  exercise_name: string;
+  method: string;
+  rank: number;
+  score: number;
+  start_time: number;
+  end_time: number;
+  loop_duration: number;
+  algorithm: string;
+  fade_frames: number;
+  video_url: string;
+  rating: string | null;
+  reviewed: boolean;
+  flagged: boolean;
+  keeper: boolean;
+  downloaded: boolean;
+  created_at: string;
+}
+
+export interface LoopExerciseSummary {
+  exerciseName: string;
+  variantCount: number;
+  reviewed: boolean;
+  hasKeeper: boolean;
+  keeperLabel: string | null;
+  flagged: boolean;
+  downloaded: boolean;
+  latestCreatedAt: string;
+  rows: LoopResultRow[];
+}
+
 // --- Project types ---
 
 export interface Project {

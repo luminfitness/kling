@@ -1,87 +1,80 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { supabase } from '@/lib/supabase';
-
-interface BatchCandidate {
-  rank: number;
-  startTime: number;
-  endTime: number;
-  duration: number;
-  score: number;
-  url1f: string | null;
-  url3f: string | null;
-}
-
-interface BatchExercise {
-  name: string;
-  file: File;
-  status: 'pending' | 'processing' | 'done' | 'error';
-  error?: string;
-  candidates: BatchCandidate[];
-  flagged: boolean;
-}
-
-interface VideoRating {
-  [key: string]: 'good' | 'bad';
-}
+import type { LoopExerciseSummary } from '@/types';
 
 interface BatchReviewCarouselProps {
-  exercises: BatchExercise[];
-  onUpdateExercises: (exercises: BatchExercise[]) => void;
+  exercises: LoopExerciseSummary[];
+  onSetKeeper: (rowId: string) => Promise<void>;
+  onClearKeeper: (exerciseName: string) => Promise<void>;
+  onToggleFlag: (exerciseName: string) => Promise<void>;
+  onMarkReviewed: (exerciseName: string) => Promise<void>;
+  onMarkDownloaded: (rowId: string) => Promise<void>;
+  onUpdateRating: (rowId: string, rating: string | null) => Promise<void>;
+  onUpdate: () => void;
   onBack: () => void;
 }
 
 export default function BatchReviewCarousel({
   exercises,
-  onUpdateExercises,
+  onSetKeeper,
+  onClearKeeper,
+  onToggleFlag,
+  onMarkReviewed,
+  onMarkDownloaded,
+  onUpdate,
   onBack,
 }: BatchReviewCarouselProps) {
   const [currentIdx, setCurrentIdx] = useState(0);
-  const [ratings, setRatings] = useState<VideoRating>({});
-  const [downloaded, setDownloaded] = useState<Set<string>>(new Set());
   const [showExitSummary, setShowExitSummary] = useState(false);
 
-  const completed = exercises.filter((e) => e.status === 'done' || e.status === 'error');
-  const current = completed[currentIdx];
+  const current = exercises[currentIdx];
   const flaggedCount = exercises.filter((e) => e.flagged).length;
-  const progressPct = completed.length > 0 ? ((currentIdx + 1) / completed.length) * 100 : 0;
+  const progressPct = exercises.length > 0 ? ((currentIdx + 1) / exercises.length) * 100 : 0;
 
-  const goNext = useCallback(() => {
-    setCurrentIdx((i) => Math.min(i + 1, completed.length - 1));
-  }, [completed.length]);
+  // Auto-mark reviewed when navigating away
+  const markCurrentReviewed = useCallback(async () => {
+    if (current && !current.reviewed) {
+      await onMarkReviewed(current.exerciseName);
+    }
+  }, [current, onMarkReviewed]);
 
-  const goPrev = useCallback(() => {
+  const goNext = useCallback(async () => {
+    await markCurrentReviewed();
+    setCurrentIdx((i) => Math.min(i + 1, exercises.length - 1));
+  }, [exercises.length, markCurrentReviewed]);
+
+  const goPrev = useCallback(async () => {
+    await markCurrentReviewed();
     setCurrentIdx((i) => Math.max(i - 1, 0));
-  }, []);
+  }, [markCurrentReviewed]);
 
-  const skipToNextFlagged = useCallback(() => {
-    for (let i = currentIdx + 1; i < completed.length; i++) {
-      if (completed[i].flagged) { setCurrentIdx(i); return; }
+  const skipToNextFlagged = useCallback(async () => {
+    await markCurrentReviewed();
+    for (let i = currentIdx + 1; i < exercises.length; i++) {
+      if (exercises[i].flagged) { setCurrentIdx(i); return; }
     }
     for (let i = 0; i < currentIdx; i++) {
-      if (completed[i].flagged) { setCurrentIdx(i); return; }
+      if (exercises[i].flagged) { setCurrentIdx(i); return; }
     }
-  }, [currentIdx, completed]);
+  }, [currentIdx, exercises, markCurrentReviewed]);
 
-  // Filter to unreviewed (not downloaded, not flagged)
   const goToUnreviewed = useCallback(() => {
-    for (let i = 0; i < completed.length; i++) {
-      if (!downloaded.has(completed[i].name) && !completed[i].flagged) {
+    for (let i = 0; i < exercises.length; i++) {
+      if (!exercises[i].reviewed && !exercises[i].flagged) {
         setCurrentIdx(i);
         setShowExitSummary(false);
         return;
       }
     }
-    // If all reviewed, go to flagged
-    for (let i = 0; i < completed.length; i++) {
-      if (completed[i].flagged) {
+    for (let i = 0; i < exercises.length; i++) {
+      if (exercises[i].flagged) {
         setCurrentIdx(i);
         setShowExitSummary(false);
         return;
       }
     }
-  }, [completed, downloaded]);
+  }, [exercises]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -93,64 +86,45 @@ export default function BatchReviewCarousel({
     return () => window.removeEventListener('keydown', handler);
   }, [goNext, goPrev, showExitSummary]);
 
-  const toggleFlag = () => {
-    const updated = [...exercises];
-    const globalIdx = exercises.findIndex((e) => e.name === current.name);
-    if (globalIdx >= 0) {
-      updated[globalIdx] = { ...updated[globalIdx], flagged: !updated[globalIdx].flagged };
-      onUpdateExercises(updated);
-    }
+  const handleToggleFlag = async () => {
+    if (!current) return;
+    await onToggleFlag(current.exerciseName);
+    onUpdate();
   };
 
-  const handleRate = async (key: string, rating: 'good' | 'bad', candidate: BatchCandidate, exerciseName: string, blendType: string) => {
-    const isToggleOff = ratings[key] === rating;
-
-    setRatings((prev) => {
-      const next = { ...prev };
-      if (isToggleOff) { delete next[key]; } else { next[key] = rating; }
-      return next;
-    });
-
-    await supabase
-      .from('loop_ratings')
-      .delete()
-      .eq('file_name', exerciseName)
-      .eq('method', 'MAD')
-      .eq('rank', candidate.rank)
-      .eq('blend_type', blendType);
-
-    if (!isToggleOff) {
-      const { error } = await supabase.from('loop_ratings').insert({
-        file_name: exerciseName,
-        method: 'MAD',
-        rank: candidate.rank,
-        score: candidate.score,
-        start_time: candidate.startTime,
-        end_time: candidate.endTime,
-        loop_duration: candidate.duration,
-        rating,
-        blend_type: blendType,
-      });
-      if (error) console.error('Failed to save rating:', error);
-    }
-  };
-
-  const handleDownload = (blobUrl: string, exerciseName: string, suffix: string) => {
+  const handleDownload = async (videoUrl: string, exerciseName: string, suffix: string, rowId: string) => {
     const a = document.createElement('a');
-    a.href = blobUrl;
+    a.href = videoUrl;
     a.download = `${exerciseName}_${suffix}.mp4`;
+    a.target = '_blank';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setDownloaded((prev) => new Set(prev).add(exerciseName));
+    await onMarkDownloaded(rowId);
   };
 
-  // Summary stats
-  const downloadedNames = completed.filter((e) => downloaded.has(e.name));
-  const flaggedNames = completed.filter((e) => e.flagged);
-  const unreviewedNames = completed.filter((e) => !downloaded.has(e.name) && !e.flagged);
+  const handleSetKeeper = async (rowId: string) => {
+    // If this row is already the keeper, clear it
+    const row = current?.rows.find((r) => r.id === rowId);
+    if (row?.keeper) {
+      await onClearKeeper(current.exerciseName);
+    } else {
+      await onSetKeeper(rowId);
+    }
+    onUpdate();
+  };
 
-  if (completed.length === 0) {
+  const handleDone = async () => {
+    await markCurrentReviewed();
+    setShowExitSummary(true);
+  };
+
+  const handleExit = async () => {
+    await markCurrentReviewed();
+    onBack();
+  };
+
+  if (exercises.length === 0) {
     return (
       <div className="text-center py-12 text-gray-500">
         <p>No exercises to review.</p>
@@ -161,6 +135,10 @@ export default function BatchReviewCarousel({
     );
   }
 
+  // Summary stats
+  const reviewedCount = exercises.filter((e) => e.reviewed).length;
+  const unreviewedCount = exercises.filter((e) => !e.reviewed && !e.flagged).length;
+
   // ─── Exit Summary Modal ──────────────────────────────────────────────────
   if (showExitSummary) {
     return (
@@ -169,41 +147,34 @@ export default function BatchReviewCarousel({
           <h2 className="text-lg font-semibold text-gray-900">Review Summary</h2>
 
           <div className="space-y-3">
-            {/* Downloaded */}
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-full bg-green-100 flex items-center justify-center">
-                <DownloadIconMd className="text-green-700" />
+                <svg className="h-4 w-4 text-green-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
               </div>
-              <div>
-                <p className="text-sm font-medium text-gray-900">{downloadedNames.length} downloaded</p>
-              </div>
+              <p className="text-sm font-medium text-gray-900">{reviewedCount} reviewed</p>
             </div>
 
-            {/* Flagged */}
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center">
                 <FlagIcon className="text-orange-600 h-4 w-4" />
               </div>
-              <div>
-                <p className="text-sm font-medium text-gray-900">{flaggedNames.length} flagged</p>
-              </div>
+              <p className="text-sm font-medium text-gray-900">{flaggedCount} flagged</p>
             </div>
 
-            {/* Unreviewed */}
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center">
                 <svg className="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </div>
-              <div>
-                <p className="text-sm font-medium text-gray-900">{unreviewedNames.length} not reviewed</p>
-              </div>
+              <p className="text-sm font-medium text-gray-900">{unreviewedCount} not reviewed</p>
             </div>
           </div>
 
           <div className="flex gap-2 pt-2">
-            {(flaggedNames.length > 0 || unreviewedNames.length > 0) && (
+            {(flaggedCount > 0 || unreviewedCount > 0) && (
               <button
                 onClick={goToUnreviewed}
                 className="flex-1 px-4 py-2.5 text-sm font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors"
@@ -223,6 +194,20 @@ export default function BatchReviewCarousel({
     );
   }
 
+  if (!current) return null;
+
+  // Group rows by rank for display
+  const rowsByRank = new Map<number, typeof current.rows>();
+  for (const row of current.rows) {
+    const existing = rowsByRank.get(row.rank);
+    if (existing) {
+      existing.push(row);
+    } else {
+      rowsByRank.set(row.rank, [row]);
+    }
+  }
+  const sortedRanks = Array.from(rowsByRank.entries()).sort(([a], [b]) => a - b);
+
   // ─── Main Review UI ──────────────────────────────────────────────────────
   return (
     <div className="space-y-4">
@@ -234,9 +219,8 @@ export default function BatchReviewCarousel({
         />
       </div>
 
-      {/* Header: Back (left) | Name + progress (center) | Flag + Next (right) */}
+      {/* Header */}
       <div className="flex items-center justify-between">
-        {/* Left: Back */}
         <button
           onClick={goPrev}
           disabled={currentIdx === 0}
@@ -245,11 +229,12 @@ export default function BatchReviewCarousel({
           &larr; Back
         </button>
 
-        {/* Center: Exercise name + counter */}
         <div className="text-center">
-          <h2 className="text-lg font-semibold text-gray-900">{current.name}</h2>
+          <h2 className="text-lg font-semibold text-gray-900">
+            {current.exerciseName.replace(/\.[^.]+$/, '')}
+          </h2>
           <p className="text-sm text-gray-500 font-medium">
-            {currentIdx + 1} of {completed.length}
+            {currentIdx + 1} of {exercises.length}
             {flaggedCount > 0 && (
               <button
                 onClick={skipToNextFlagged}
@@ -261,10 +246,9 @@ export default function BatchReviewCarousel({
           </p>
         </div>
 
-        {/* Right: Flag icon + Next/Done */}
         <div className="flex items-center gap-2">
           <button
-            onClick={toggleFlag}
+            onClick={handleToggleFlag}
             className={`p-2 rounded-lg border transition-colors ${
               current.flagged
                 ? 'text-orange-600 bg-orange-100 border-orange-300'
@@ -274,9 +258,9 @@ export default function BatchReviewCarousel({
           >
             <FlagIcon className="h-5 w-5" />
           </button>
-          {currentIdx >= completed.length - 1 ? (
+          {currentIdx >= exercises.length - 1 ? (
             <button
-              onClick={() => setShowExitSummary(true)}
+              onClick={handleDone}
               className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors"
             >
               Done
@@ -292,34 +276,28 @@ export default function BatchReviewCarousel({
         </div>
       </div>
 
-      {/* Error state */}
-      {current.status === 'error' && (
-        <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
-          Error: {current.error || 'Unknown error'}
-        </div>
-      )}
-
-      {/* Candidates */}
-      {current.status === 'done' && current.candidates.length > 0 && (
-        <div className={`grid gap-4 ${current.candidates.length === 1 ? 'grid-cols-1 max-w-sm mx-auto' : current.candidates.length === 2 ? 'grid-cols-2 max-w-2xl mx-auto' : 'grid-cols-3'}`}>
-          {current.candidates.map((c, cIdx) => {
-            const key1f = `${current.name}-${c.rank}-1f`;
-            const key3f = `${current.name}-${c.rank}-3f`;
+      {/* Candidates by rank */}
+      {sortedRanks.length > 0 ? (
+        <div className={`grid gap-4 ${sortedRanks.length === 1 ? 'grid-cols-1 max-w-sm mx-auto' : sortedRanks.length === 2 ? 'grid-cols-2 max-w-2xl mx-auto' : 'grid-cols-3'}`}>
+          {sortedRanks.map(([rank, rows]) => {
+            const first = rows[0];
+            const row1f = rows.find((r) => r.fade_frames === 1);
+            const row3f = rows.find((r) => r.fade_frames === 3);
 
             return (
-              <div key={cIdx} className="border border-gray-200 rounded-xl p-3 space-y-3">
+              <div key={rank} className="border border-gray-200 rounded-xl p-3 space-y-3">
                 {/* Candidate header */}
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-sm font-semibold text-gray-600">#{c.rank}</span>
+                  <span className="text-sm font-semibold text-gray-600">#{rank}</span>
                   <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
-                    c.score >= 0.9 ? 'bg-green-100 text-green-800' :
-                    c.score >= 0.8 ? 'bg-yellow-100 text-yellow-800' :
+                    first.score >= 0.9 ? 'bg-green-100 text-green-800' :
+                    first.score >= 0.8 ? 'bg-yellow-100 text-yellow-800' :
                     'bg-red-100 text-red-800'
                   }`}>
-                    {(c.score * 100).toFixed(1)}%
+                    {(first.score * 100).toFixed(1)}%
                   </span>
                   <span className="text-xs font-mono text-gray-400">
-                    {c.startTime}s&rarr;{c.endTime}s
+                    {first.start_time}s&rarr;{first.end_time}s
                   </span>
                 </div>
 
@@ -328,101 +306,77 @@ export default function BatchReviewCarousel({
                   {/* 1f */}
                   <div>
                     <p className="text-xs font-medium text-gray-500 text-center mb-1">1f crossfade</p>
-                    {c.url1f ? (
-                      <video src={c.url1f} loop autoPlay muted playsInline className="w-full rounded-lg aspect-[9/16] object-contain bg-black" />
+                    {row1f?.video_url ? (
+                      <video src={row1f.video_url} loop autoPlay muted playsInline className="w-full rounded-lg aspect-[9/16] object-contain bg-black" />
                     ) : (
-                      <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center text-xs text-gray-400">Failed</div>
+                      <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center text-xs text-gray-400">N/A</div>
                     )}
-                    <div className="flex items-center justify-center gap-2 mt-2">
-                      <button
-                        onClick={() => handleRate(key1f, 'good', c, current.name, 'crossfade_1f')}
-                        className={`p-2 rounded-lg border transition-colors ${
-                          ratings[key1f] === 'good'
-                            ? 'bg-green-100 border-green-300 text-green-700'
-                            : 'bg-white border-gray-200 text-gray-400 hover:border-green-300 hover:text-green-600'
-                        }`}
-                      >
-                        <ThumbsUp />
-                      </button>
-                      <button
-                        onClick={() => handleRate(key1f, 'bad', c, current.name, 'crossfade_1f')}
-                        className={`p-2 rounded-lg border transition-colors ${
-                          ratings[key1f] === 'bad'
-                            ? 'bg-red-100 border-red-300 text-red-700'
-                            : 'bg-white border-gray-200 text-gray-400 hover:border-red-300 hover:text-red-600'
-                        }`}
-                      >
-                        <ThumbsDown />
-                      </button>
-                      {c.url1f && (
+                    {row1f && (
+                      <div className="flex items-center justify-center gap-1.5 mt-2">
                         <button
-                          onClick={() => handleDownload(c.url1f!, current.name, '1f')}
-                          className={`p-2 rounded-lg border transition-colors ${
-                            downloaded.has(current.name)
-                              ? 'bg-blue-50 border-blue-200 text-blue-600'
-                              : 'bg-white border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-600'
+                          onClick={() => handleSetKeeper(row1f.id)}
+                          className={`p-1.5 rounded-lg border transition-colors ${
+                            row1f.keeper
+                              ? 'bg-amber-100 border-amber-300 text-amber-700'
+                              : 'bg-white border-gray-200 text-gray-400 hover:border-amber-300 hover:text-amber-600'
                           }`}
-                          title="Download"
+                          title={row1f.keeper ? 'Remove as keeper' : 'Keep this one'}
                         >
-                          <DownloadIconMd />
+                          <StarIcon />
                         </button>
-                      )}
-                    </div>
+                        {row1f.video_url && (
+                          <button
+                            onClick={() => handleDownload(row1f.video_url, current.exerciseName, `rank${rank}_1f`, row1f.id)}
+                            className="p-1.5 rounded-lg border bg-white border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-600 transition-colors"
+                            title="Download"
+                          >
+                            <DownloadIconMd />
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* 3f */}
                   <div>
                     <p className="text-xs font-medium text-gray-500 text-center mb-1">3f crossfade</p>
-                    {c.url3f ? (
-                      <video src={c.url3f} loop autoPlay muted playsInline className="w-full rounded-lg aspect-[9/16] object-contain bg-black" />
+                    {row3f?.video_url ? (
+                      <video src={row3f.video_url} loop autoPlay muted playsInline className="w-full rounded-lg aspect-[9/16] object-contain bg-black" />
                     ) : (
-                      <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center text-xs text-gray-400">Failed</div>
+                      <div className="w-full rounded-lg bg-gray-100 aspect-[9/16] flex items-center justify-center text-xs text-gray-400">N/A</div>
                     )}
-                    <div className="flex items-center justify-center gap-2 mt-2">
-                      <button
-                        onClick={() => handleRate(key3f, 'good', c, current.name, 'crossfade_3f')}
-                        className={`p-2 rounded-lg border transition-colors ${
-                          ratings[key3f] === 'good'
-                            ? 'bg-green-100 border-green-300 text-green-700'
-                            : 'bg-white border-gray-200 text-gray-400 hover:border-green-300 hover:text-green-600'
-                        }`}
-                      >
-                        <ThumbsUp />
-                      </button>
-                      <button
-                        onClick={() => handleRate(key3f, 'bad', c, current.name, 'crossfade_3f')}
-                        className={`p-2 rounded-lg border transition-colors ${
-                          ratings[key3f] === 'bad'
-                            ? 'bg-red-100 border-red-300 text-red-700'
-                            : 'bg-white border-gray-200 text-gray-400 hover:border-red-300 hover:text-red-600'
-                        }`}
-                      >
-                        <ThumbsDown />
-                      </button>
-                      {c.url3f && (
+                    {row3f && (
+                      <div className="flex items-center justify-center gap-1.5 mt-2">
                         <button
-                          onClick={() => handleDownload(c.url3f!, current.name, '3f')}
-                          className={`p-2 rounded-lg border transition-colors ${
-                            downloaded.has(current.name)
-                              ? 'bg-blue-50 border-blue-200 text-blue-600'
-                              : 'bg-white border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-600'
+                          onClick={() => handleSetKeeper(row3f.id)}
+                          className={`p-1.5 rounded-lg border transition-colors ${
+                            row3f.keeper
+                              ? 'bg-amber-100 border-amber-300 text-amber-700'
+                              : 'bg-white border-gray-200 text-gray-400 hover:border-amber-300 hover:text-amber-600'
                           }`}
-                          title="Download"
+                          title={row3f.keeper ? 'Remove as keeper' : 'Keep this one'}
                         >
-                          <DownloadIconMd />
+                          <StarIcon />
                         </button>
-                      )}
-                    </div>
+                        {row3f.video_url && (
+                          <button
+                            onClick={() => handleDownload(row3f.video_url, current.exerciseName, `rank${rank}_3f`, row3f.id)}
+                            className="p-1.5 rounded-lg border bg-white border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-600 transition-colors"
+                            title="Download"
+                          >
+                            <DownloadIconMd />
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
             );
           })}
         </div>
-      )}
-
-      {current.status === 'done' && current.candidates.length === 0 && (
-        <p className="text-sm text-gray-400">No loop candidates found for this video.</p>
+      ) : (
+        <p className="text-sm text-gray-400">No loop candidates found for this exercise.</p>
       )}
     </div>
   );
@@ -436,25 +390,17 @@ function FlagIcon({ className = '' }: { className?: string }) {
   );
 }
 
-function ThumbsUp() {
+function StarIcon() {
   return (
-    <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M14 10h4.764a2 2 0 011.789 2.894l-3.5 7A2 2 0 0115.263 21h-4.017c-.163 0-.326-.02-.485-.06L7 20m7-10V5a2 2 0 00-2-2h-.095c-.5 0-.905.405-.905.905 0 .714-.211 1.412-.608 2.006L7 11v9m7-10h-2M7 20H5a2 2 0 01-2-2v-6a2 2 0 012-2h2.5" />
+    <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
+      <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />
     </svg>
   );
 }
 
-function ThumbsDown() {
+function DownloadIconMd() {
   return (
     <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018c.163 0 .326.02.485.06L17 4m-7 10v2a3.5 3.5 0 003.5 3.5h.792c.458 0 .828-.37.828-.828 0-.714.211-1.412.608-2.006L17 13V4m-7 10h2m5-6h2a2 2 0 012 2v6a2 2 0 01-2 2h-2.5" />
-    </svg>
-  );
-}
-
-function DownloadIconMd({ className = '' }: { className?: string }) {
-  return (
-    <svg className={className || 'h-5 w-5'} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
     </svg>
   );
