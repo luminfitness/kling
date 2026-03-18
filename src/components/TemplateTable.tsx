@@ -849,17 +849,6 @@ export default function TemplateTable({
                   )}
                 </div>
               </th>
-              <th
-                onClick={() => onSort('equipment')}
-                className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 whitespace-nowrap"
-              >
-                <div className="flex items-center gap-1">
-                  Equipment
-                  {sortColumn === 'equipment' && (
-                    <span className="text-blue-500">{sortDirection === 'asc' ? '↑' : '↓'}</span>
-                  )}
-                </div>
-              </th>
             </tr>
           </thead>
           <tbody>
@@ -933,14 +922,6 @@ export default function TemplateTable({
                     </div>
                   </td>
 
-                  {/* Equipment */}
-                  <td className="px-2 py-2 whitespace-nowrap">
-                    {t.equipmentType ? (
-                      <Badge variant="equipment" value={t.equipmentType} />
-                    ) : (
-                      <span className="text-sm text-gray-400">—</span>
-                    )}
-                  </td>
                 </tr>
               );
             })}

@@ -657,17 +657,6 @@ export default function ExerciseTable({
                 </div>
               </th>
               <th
-                onClick={() => onSort?.('equipment')}
-                className={`w-[110px] px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider ${onSort ? 'cursor-pointer hover:bg-gray-100' : ''}`}
-              >
-                <div className="flex items-center gap-1">
-                  Equipment
-                  {sortColumn === 'equipment' && (
-                    <span className="text-blue-500">{sortDirection === 'asc' ? '↑' : '↓'}</span>
-                  )}
-                </div>
-              </th>
-              <th
                 onClick={() => onSort?.('completed')}
                 className={`w-[160px] px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap ${onSort ? 'cursor-pointer hover:bg-gray-100' : ''}`}
               >
@@ -708,14 +697,6 @@ export default function ExerciseTable({
                     </div>
                   </td>
 
-                  {/* Equipment */}
-                  <td className="px-2 py-2">
-                    {exercise.equipmentType ? (
-                      <Badge variant="equipment" value={exercise.equipmentType} />
-                    ) : (
-                      <span className="text-sm text-gray-400">—</span>
-                    )}
-                  </td>
 
                   {/* Completed */}
                   <td className="px-2 py-2 whitespace-nowrap">
