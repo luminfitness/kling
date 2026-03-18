@@ -120,7 +120,12 @@ export default function LoopFinderPage() {
 
       try {
         // Find loop points (MAD only)
-        const candidates = await findLoopPointsMADOnly(sourceUrl, () => {});
+        console.log(`[Batch] Processing ${updated[i].name} (${i + 1}/${updated.length})...`);
+        const candidates = await findLoopPointsMADOnly(sourceUrl, (p) => {
+          if (p.stage === 'extracting' && p.current % 20 === 0) {
+            console.log(`[Batch] ${updated[i].name}: extracting frame ${p.current}/${p.total}`);
+          }
+        });
 
         // Generate crossfade variants for each candidate
         const batchCandidates: BatchCandidate[] = [];
@@ -154,9 +159,11 @@ export default function LoopFinderPage() {
           });
         }
 
+        console.log(`[Batch] ${updated[i].name}: done — ${batchCandidates.length} candidates`);
         updated[i] = { ...updated[i], status: 'done', candidates: batchCandidates };
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`[Batch] ${updated[i].name}: FAILED —`, msg);
         updated[i] = { ...updated[i], status: 'error', error: msg };
         errorCount++;
         setBatchErrorCount(errorCount);

@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 interface BatchProcessingModalProps {
   currentIndex: number;
@@ -17,6 +18,10 @@ export default function BatchProcessingModal({
   errorCount,
   elapsedMs,
 }: BatchProcessingModalProps) {
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => setMounted(true), []);
+
   // Warn before closing tab
   useEffect(() => {
     const handler = (e: BeforeUnloadEvent) => {
@@ -39,8 +44,8 @@ export default function BatchProcessingModal({
       : `~${etaSec}s remaining`
     : 'Estimating...';
 
-  return (
-    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center">
+  const modal = (
+    <div className="fixed inset-0 z-[9999] bg-black/60 flex items-center justify-center">
       <div className="bg-white rounded-2xl shadow-xl max-w-md w-full mx-4 p-6 space-y-4">
         <h2 className="text-lg font-semibold text-gray-900">Processing Videos</h2>
         <p className="text-sm text-gray-500">Keep this tab open — processing videos in-browser.</p>
@@ -75,4 +80,7 @@ export default function BatchProcessingModal({
       </div>
     </div>
   );
+
+  if (!mounted) return null;
+  return createPortal(modal, document.body);
 }

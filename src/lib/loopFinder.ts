@@ -36,6 +36,7 @@ const FRAME_HEIGHT = 120;
 const PIXEL_COUNT = FRAME_WIDTH * FRAME_HEIGHT;
 const MAX_FRAMES = 300;
 const FRAME_INTERVAL = 0.1; // seconds between frames
+const SEEK_TIMEOUT_MS = 5000; // max wait for a single seek operation
 const MIN_LOOP_DURATION = 2.5; // seconds — exercise reps are never shorter than this
 const IDEAL_MIN = 3; // sweet spot lower bound
 const IDEAL_MAX = 7; // sweet spot upper bound
@@ -120,9 +121,16 @@ async function extractFrames(
     video.src = videoUrl;
   });
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     if (video.readyState >= 3) { resolve(); return; }
-    video.oncanplaythrough = () => resolve();
+    const timer = setTimeout(() => {
+      video.oncanplaythrough = null;
+      reject(new Error('Video failed to load — timed out waiting for canplaythrough'));
+    }, 15000);
+    video.oncanplaythrough = () => {
+      clearTimeout(timer);
+      resolve();
+    };
     video.load();
   });
 
@@ -141,8 +149,15 @@ async function extractFrames(
     onProgress(i + 1, totalFrames);
 
     video.currentTime = time;
-    await new Promise<void>((resolve) => {
-      video.onseeked = () => resolve();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        video.onseeked = null;
+        reject(new Error(`Seek timed out at ${time.toFixed(2)}s (frame ${i + 1}/${totalFrames})`));
+      }, SEEK_TIMEOUT_MS);
+      video.onseeked = () => {
+        clearTimeout(timer);
+        resolve();
+      };
     });
 
     ctx.drawImage(video, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
@@ -310,9 +325,16 @@ async function captureFrameAtTime(videoUrl: string, time: number): Promise<strin
     video.src = videoUrl;
   });
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     if (video.readyState >= 3) { resolve(); return; }
-    video.oncanplaythrough = () => resolve();
+    const timer = setTimeout(() => {
+      video.oncanplaythrough = null;
+      reject(new Error('Video failed to load — timed out waiting for canplaythrough'));
+    }, 15000);
+    video.oncanplaythrough = () => {
+      clearTimeout(timer);
+      resolve();
+    };
     video.load();
   });
 
