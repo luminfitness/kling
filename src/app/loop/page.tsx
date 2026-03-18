@@ -237,7 +237,6 @@ export default function LoopFinderPage() {
     setBatchCurrentIdx(0);
     setBatchErrorCount(0);
     setReviewMode('none');
-    setReviewExercises([]);
   };
 
   // ─── Review handlers ───────────────────────────────────────────────────
